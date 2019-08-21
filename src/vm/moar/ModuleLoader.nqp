@@ -1,6 +1,55 @@
 knowhow ModuleLoader {
     my %modules_loaded;
     my %settings_loaded;
+    my %cache := nqp::getcurhllsym('bytecode_cache');
+
+    method !load(%loaded, $path, @search_paths) {
+        my $buffer;
+
+        # Check the bytecode cache first.
+        if nqp::defined(%cache) && nqp::existskey(%cache, $path) {
+            $buffer := nqp::atkey(%cache, $path);
+        }
+
+        # Otherwise, hit the file system.
+        else {
+            for @search_paths -> $prefix {
+                if nqp::stat("$prefix/$path", 0) {
+                    $path := "$prefix/$path";
+                    last;
+                }
+            }
+        }
+
+        # XXX It would be nice to check %loaded before hitting the file system,
+        # but this breaks stage2 compilation...
+        if nqp::existskey(%loaded, $path) {
+            %loaded{$path};
+        }
+        else {
+            my $*CTXSAVE := self;
+            my $*MAIN_CTX := ModuleLoader;
+            my $boot_mode;
+
+            try { $boot_mode := nqp::ifnull(nqp::ifnull(%*COMPILING, {})<%?OPTIONS>, {})<bootstrap>; }
+            $boot_mode := !nqp::isnull($boot_mode) && $boot_mode;
+
+            my $preserve_global := nqp::getcurhllsym('GLOBAL');
+            nqp::usecompileehllconfig() if $boot_mode;
+
+            if nqp::defined($buffer) {
+                nqp::loadbytecodebuffer($buffer);
+            }
+            else {
+                nqp::loadbytecode($path);
+            }
+
+            nqp::usecompilerhllconfig() if $boot_mode;
+            nqp::bindcurhllsym('GLOBAL', $preserve_global);
+
+            %loaded{$path} := $*MAIN_CTX;
+        }
+    }
 
     method search_path($explicit_path) {
         my @search_paths;
@@ -28,31 +77,9 @@ knowhow ModuleLoader {
         # If we didn't already do so, load the module and capture
         # its mainline. Otherwise, we already loaded it so go on
         # with what we already have.
-        my $module_ctx;
         my $path := nqp::join('/', nqp::split('::', $module_name)) ~ '.moarvm';
-        my @prefixes := self.search_path('module-path');
-        for @prefixes -> $prefix {
-            if nqp::stat("$prefix/$path", 0) {
-                $path := "$prefix/$path";
-                last;
-            }
-        }
-        if nqp::existskey(%modules_loaded, $path) {
-            $module_ctx := %modules_loaded{$path};
-        }
-        else {
-            my $*CTXSAVE := self;
-            my $*MAIN_CTX := ModuleLoader;
-            my $boot_mode;
-            try { $boot_mode := nqp::ifnull(nqp::ifnull(%*COMPILING, {})<%?OPTIONS>, {})<bootstrap>; }
-            $boot_mode := !nqp::isnull($boot_mode) && $boot_mode;
-            my $preserve_global := nqp::getcurhllsym('GLOBAL');
-            nqp::usecompileehllconfig() if $boot_mode;
-            nqp::loadbytecode($path);
-            nqp::usecompilerhllconfig() if $boot_mode;
-            nqp::bindcurhllsym('GLOBAL', $preserve_global);
-            %modules_loaded{$path} := $module_ctx := $*MAIN_CTX;
-        }
+        my @search_paths := self.search_path('module-path');
+        my $module_ctx := self.'!load'(%modules_loaded, $path, @search_paths);
 
         # Provided we have a mainline...
         if nqp::defined($module_ctx) {
@@ -131,35 +158,14 @@ knowhow ModuleLoader {
         my $setting;
 
         if $setting_name ne 'NULL' {
-            # Add path prefix and .setting suffix.
+            # Add .setting suffix.
             my $path := "$setting_name.setting.moarvm";
-            my @prefixes := self.search_path('setting-path');
-            for @prefixes -> $prefix {
-                if nqp::stat("$prefix/$path", 0) {
-                    $path := "$prefix/$path";
-                    last;
-                }
-            }
+            my @search_paths := self.search_path('setting-path');
+            $setting := self.'!load'(%settings_loaded, $path, @search_paths);
 
-            # Unless we already did so, load the setting.
-            unless nqp::existskey(%settings_loaded, $path) {
-                my $*CTXSAVE := self;
-                my $*MAIN_CTX := ModuleLoader;
-                my $boot_mode;
-                try { $boot_mode := nqp::ifnull(nqp::ifnull(%*COMPILING, {})<%?OPTIONS>, {})<bootstrap>; }
-                $boot_mode := !nqp::isnull($boot_mode) && $boot_mode;
-                my $preserve_global := nqp::getcurhllsym('GLOBAL');
-                nqp::usecompileehllconfig() if $boot_mode;
-                nqp::loadbytecode($path);
-                nqp::usecompilerhllconfig() if $boot_mode;
-                nqp::bindcurhllsym('GLOBAL', $preserve_global);
-                unless nqp::defined($*MAIN_CTX) {
-                    nqp::die("Unable to load setting $setting_name; maybe it is missing a YOU_ARE_HERE?");
-                }
-                %settings_loaded{$path} := $*MAIN_CTX;
+            unless nqp::defined($setting) {
+                nqp::die("Unable to load setting $setting_name; maybe it is missing a YOU_ARE_HERE?");
             }
-
-            $setting := %settings_loaded{$path};
         }
 
         $setting;
